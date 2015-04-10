@@ -1,0 +1,16 @@
+[user]
+  name = Leandro Gualter
+  email = leandrogualter@gmail.com
+[branch]
+  autosetuprebase = always
+[apply]
+  whitespace = warn
+[alias]
+  co = checkout
+  ci = commit
+  st = status
+  br = branch
+  type = cat-file -t
+  dump = cat-file -p
+  ll = log --graph --decorate --pretty=oneline --abbrev-commit
+  pr = pull -r
