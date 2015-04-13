@@ -23,9 +23,12 @@ alias gb='git branch '
 alias gc='git commit'
 alias gd='git diff'
 alias go='git checkout '
+alias ggrep='git grep'
 
 alias vg=vagrant
 
 alias create_alias='vim ~/.bash_aliases;source ~/.bash_aliases'
 
 alias projects='cd ~/projects'
+alias nebula='cd ~/projects/nebula'
+alias tools_project='cd ~/projects/tools_project'
