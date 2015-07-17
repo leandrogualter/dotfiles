@@ -1,5 +1,17 @@
+# Imports
+. ./.bash_imports/awshelper
+. ./.bash_imports/git-prompt
+
+# Bash completion
+if [ -f $(brew --prefix)/etc/bash_completion ]; then
+  . $(brew --prefix)/etc/bash_completion
+fi
+# Shows an * if repo is dirty
+export GIT_PS1_SHOWDIRTYSTATE=1
+export GIT_PS1_SHOWUPSTREAM="auto"
+
 # Prompt definitions
-PS1="\[$(tput bold)\]\[$(tput setaf 4)\][\[$(tput setaf 1)\]\u\[$(tput setaf 4)\]@\[$(tput setaf 1)\]\h \[$(tput setaf 2)\]\W\[$(tput setaf 4)\] \[$(tput sgr0)\]\`if [ \$? = 0 ]; then echo \[\e[33m\]^_^\[\e[0m\]; else echo \[\e[31m\]O_o\[\e[0m\]; fi\`\[$(tput bold)\]\[$(tput setaf 4)\]]\$\[$(tput sgr0)\] "
+export PS1="\[$(tput bold)\]\[$(tput setaf 4)\][\[$(tput setaf 1)\]\u\[$(tput setaf 4)\]@\[$(tput setaf 1)\]\h \[$(tput setaf 2)\]\W\[$(tput setaf 4)\] \[$(tput sgr0)\]\`if [ \$? = 0 ]; then echo \[\e[33m\]^_^\[\e[0m\]; else echo \[\e[31m\]O_o\[\e[0m\]; fi\`\[$(tput bold)\]\[$(tput setaf 4)\]]\`echo $(__git_ps1 "\[$(tput setaf 4)\][\[$(tput setaf 1)\]%s\[$(tput setaf 4)\]]");\`\$\[$(tput sgr0)\] "
 
 # Some colors
 export CLICOLOR=1
@@ -26,3 +38,10 @@ fi
 
 # Set VIM as the default editor
 export EDITOR=vim
+
+# Starting up ssh-agent
+eval `ssh-agent -s`
+
+# Adds ssh keys
+ssh-add ~/.ssh/github
+ssh-add ~/.ssh/apt-stash

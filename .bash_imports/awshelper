@@ -1,0 +1,542 @@
+#!/bin/bash
+# Source this file for lots of AWS goodness
+# Or, call this as a script passing any function as a subcommand
+#   Example: watch awshelper stacks
+EXEC="$0"
+SCRIPTNAME=${EXEC##*/}
+SELF=${BASH_SOURCE##*/}
+
+#;###########
+#;# Colors ##
+#;###########
+export TERM_RED=$(tput setaf 1)
+export TERM_GREEN=$(tput setaf 2)
+export TERM_ORANGE=$(tput setaf 3)
+export TERM_BLUE=$(tput setaf 4)
+export TERM_PURPLE=$(tput setaf 5)
+export TERM_WHITE=$(tput setaf 7)
+export TERM_BOLD=$(tput bold)
+export TERM_NORM=$(tput op)
+export TERM_RESET=$(tput sgr0)
+
+#;###########
+#; Aliases ##
+#;###########
+alias load_aws_credentials='source $PROJECTS_HOME/swa_home/bin/aws_credentials.sh' # Old aws credential loader
+alias source_awshelper='source $PROJECTS_HOME/swa_home/bin/awshelper' # Reload awshelper
+alias saw='source $PROJECTS_HOME/swa_home/bin/awshelper' # Reload awshelper
+
+#########
+## APT ##
+#########
+apt_environments() { # ; # List APT environments
+  ruby -ryaml -e "puts YAML.load_file('$PROJECTS_HOME/nebula/etc/network_config.yaml').keys"
+}
+
+apt_environment() { # <environment name> ; # Set APT Environment
+  export APT_ENVIRONMENT="$1"
+}
+
+#########
+## EC2 ##
+#########
+assh() { # [username@]<ip|dnsname|ec2name|id>; # SSH to EC2 instance, username defaults to ubuntu
+  read username host ssh_key <<<$(_aws_ssh_helper $1)
+  shift
+  ssh -o StrictHostKeyChecking=no -i ~/.ssh/${ssh_key}.pem $username@$host $@
+}
+
+ascp() { # <local> <remote> | <remote> <local>; # SCP with assh magic
+  local i=0 arg fix_args=("$@")
+  for arg in "$@"; do
+    if [[ "$arg" =~ ':' ]]; then # This is a remote spec, fix it up
+      local remote_host remote_filespec username host ssh_key
+      IFS=':' read -r remote_host remote_filespec <<< "$arg"
+      read username host ssh_key <<<$(_aws_ssh_helper $remote_host)
+      fix_args[$i]="${username}@${host}:${remote_filespec}"
+      break
+    fi
+    ((i++))
+  done
+  scp -o StrictHostKeyChecking=no -i ~/.ssh/${ssh_key}.pem ${fix_args[@]}
+}
+
+instances() { # [-a|--all]; # Get list of EC2 instances
+  local filters
+  if [ "$1" = "-a" -o "$1" = "--all" ]; then
+    filters=''
+  else
+    filters='--filters Name=instance-state-name,Values=running,shutting-down'
+    if [[ $APT_ENVIRONMENT ]]; then
+      filters=$filters' Name=tag-value,Values='$APT_ENVIRONMENT
+    fi
+  fi
+
+  aws ec2 describe-instances $filters \
+    --query 'Reservations[].Instances[].{PubIp:PublicIpAddress, PrivIp:PrivateIpAddress, InstanceId:InstanceId, SshKey:KeyName, AZ:Placement.AvailabilityZone, State:State.Name, Name:Tags[?Key==`Name`].Value|[0], NameProjKey:Tags[?Key==`project_key`].Value|[0], Converge:Tags[?Key==`chef_converge`].Value|[0]}' --output table
+}
+
+all_instances() { #; # Get list of all EC2 instances for all accounts and regions
+  echo "Please wait, gathering instances for all accounts and regions."
+  {
+    echo "Profile Region Id Type"
+    echo "======= ====== == ===="
+    aws_profiles |while read profile; do
+      aws_profile $profile
+      for region in us-east-1 us-west-2 us-west-1; do
+        env AWS_DEFAULT_REGION=$region \
+        aws ec2 describe-instances --query 'Reservations[].Instances[].[InstanceId, InstanceType]' --output text | while read id type; do
+          echo "$profile $region $id $type"
+        done
+      done
+    done
+  } | column -t
+}
+
+terminate_instance() { # <instance id>; # Terminate EC2 instance
+  aws ec2 terminate-instances --instance-ids "$1"
+}
+
+amis() { #; # List AMIs owned by this account
+  aws ec2 describe-images --owners self --query 'Images[*].{Id:ImageId, Name:Name, Owner:OwnerId}' --output table
+}
+
+ec2_events() { #; # List scheduled events for EC2 instances
+  aws ec2 describe-instance-status --query 'InstanceStatuses[?Events].{Instance:InstanceId,AZ:AvailabilityZone,Status:InstanceStatus.Status,Events:Events[?Description].Description}' --output table
+}
+
+uinstances() { #; # List EC2 instances (unformatted)
+  aws ec2 describe-instances --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0]}' --output text |sort
+}
+
+tags() { # <instance_name> [instance_name...]; # Get tags for instances
+  local instance
+  for instance in "$@"; do
+    local header=$(printf "Instance: %-20s" $instance |sed 's/\//\\\//g')
+    if [[ ! "$instance" =~ ^i- ]]; then # Translate instance name to instance id
+      instance=$(_instance_name_to_instance_id $instance)
+    fi
+
+    local cli_query='Tags[?Key!=`aws:cloudformation:stack-id`].{Tag:Key, Value:Value}'
+    aws ec2 describe-tags --filters Name=resource-id,Values="$instance" --query "$cli_query" --output table \
+      | sed "s/                  DescribeTags/$header/"
+  done
+}
+
+tags_all_instances() { # ; # Show tags for all EC2 instances
+  tags $(awshelper uinstances)
+}
+
+#############
+## Network ##
+#############
+subnets() { # ; # Table of subnets
+  aws ec2 describe-subnets --query 'Subnets[].{VPC:VpcId, Name:Tags[?Key==`Name`].Value|[0], CIDR:CidrBlock, ID:SubnetId, AZ:AvailabilityZone, UnusedIPs:AvailableIpAddressCount}' --output table
+}
+
+#############
+## General ##
+#############
+resource_tags() { # <resource id> [resource_id...]; # Get tags for resource
+  for resource in "$@"; do
+    local rtype=$(aws ec2 describe-tags --filters Name=resource-id,Values="$resource" --query 'Tags[].[ResourceType][0]' --output text)
+    local header=$(printf "%12s: %-12s" $rtype $resource)
+    aws ec2 describe-tags --filters  Name=resource-id,Values="$resource" --query 'Tags[].{Key:Key,Value:Value}' --output table \
+      | sed "s/              DescribeTags/$header/"
+  done
+}
+
+
+aws_account_limits() { # ; # Get account limits
+  aws ec2 describe-account-attributes --query 'AccountAttributes[*].{Name:AttributeName, Value:AttributeValues[0].AttributeValue}' --output table
+}
+
+####################
+## CloudFormation ##
+####################
+
+stacks() { #; # List launched CFN stacks
+  local cli_query
+
+  if [ -n "$APT_ENVIRONMENT" ]; then # filter by environment
+    cli_query="StackSummaries[?contains(StackName,\`${APT_ENVIRONMENT}-\`) == \`true\`].{StackName:StackName, Description:TemplateDescription, Status:StackStatus, CreateTime:CreationTime}"
+  else # show all
+    cli_query='StackSummaries[].{StackName:StackName, Description:TemplateDescription, Status:StackStatus, CreateTime:CreationTime}'
+  fi
+  aws cloudformation list-stacks \
+  --stack-status-filter CREATE_COMPLETE CREATE_IN_PROGRESS ROLLBACK_COMPLETE UPDATE_COMPLETE DELETE_IN_PROGRESS UPDATE_ROLLBACK_IN_PROGRESS CREATE_FAILED DELETE_FAILED UPDATE_ROLLBACK_COMPLETE \
+  --query "$cli_query" \
+  --output table
+}
+
+all_stacks() { #; # List launched CFN stacks on all accounts
+  saved_aws_profile=$(aws_profile)
+  u_aws_each_profile ustacks
+  aws_profile $saved_aws_profile
+}
+
+
+stack_resources() { # <stack>; # Get stack resources
+  aws cloudformation list-stack-resources --query 'StackResourceSummaries[].{Name:LogicalResourceId, Type:ResourceType, Status:ResourceStatus}' --stack-name "$1" --output table
+}
+
+stack_tags() { # <stack>; # Get stack tags
+  aws cloudformation describe-stacks --stack-name $1 --query 'Stacks[].Tags' --output table
+}
+
+stack_outputs() { # <stack>; # Get outputs from CFN stack.  Use: eval $(stack_outputs apt-utility)
+  aws cloudformation describe-stacks --stack-name "$1" --query 'Stacks[].Outputs' --output text |while read k v; do
+    echo "export $k=\"$v\";"
+  done
+}
+
+stack_events() { # <stack>; # Get events for stack
+  aws cloudformation describe-stack-events --stack-name "$1" --query 'StackEvents[*].{Stack:StackName,Resources:LogicalResourceId,Status:ResourceStatus}' --output table
+}
+
+stack_status() { # <stack>; # Get status of stack
+  aws cloudformation describe-stacks --stack-name $1 --output text --query 'Stacks[0].StackStatus'
+}
+
+stack_wait() { # <stack> <state>; # Wait for stack to reach desired state
+    while :; do
+      stack_status=$(stack_status $1)
+      echo "$1: Current: $stack_status Desired: $state "`date`
+      [ "$stack_status" = "$state" ] && break
+      [ "$stack_status" = "ROLLBACK_COMPLETE" ] && break
+      [ "$stack_status" = "UPDATE_ROLLBACK_FAILED" ] && break
+      sleep 3
+    done
+}
+
+stack_delete() { # <stack> [wait]; # Delete stack, optionally wait
+    aws cloudformation delete-stack --stack-name $1
+    [ "$2" ] && stack_wait $1 ''
+}
+
+ustacks() { #; # Unformatted list of launched CFN stacks
+  local cli_query
+  if [ -n "$APT_ENVIRONMENT" ]; then # filter by environment
+    cli_query="StackSummaries[?contains(StackName,\`${APT_ENVIRONMENT}-\`) == \`true\`].{StackName:StackName}"
+  else # show all
+    cli_query='StackSummaries[].{StackName:StackName}'
+  fi
+  aws cloudformation list-stacks \
+  --stack-status-filter CREATE_COMPLETE CREATE_IN_PROGRESS ROLLBACK_COMPLETE UPDATE_COMPLETE DELETE_IN_PROGRESS UPDATE_ROLLBACK_IN_PROGRESS CREATE_FAILED DELETE_FAILED UPDATE_ROLLBACK_COMPLETE \
+  --query "$cli_query" \
+  --output text
+}
+
+#########
+## RDS ##
+#########
+rds_delete_snapshot() { # <snapshot-id>; # Delete an RDS snapshot
+  aws rds delete-db-snapshot --db-snapshot-identifier $1
+}
+
+rds_delete_all_manual_snapshots() { # ; # Delete all manual RDS snapshots
+  awshelper urds_manual_snapshots  |xargs -n 1 awshelper rds_delete_snapshot
+}
+
+urds_manual_snapshots() { #; # Unformatted list of RDS manual snapshots
+  aws rds describe-db-snapshots --query 'DBSnapshots[?SnapshotType==`manual`].{Id:DBSnapshotIdentifier}' --output text
+}
+
+########
+## S3 ##
+########
+s3_delete_bucket() { # <s3 bucket>; # Delete the S3 bucket and its contents
+   aws s3 rb s3://$1 --force
+}
+
+s3_upload_dir() { # <dir> <s3 bucket>; # Upload directory to s3 bucket
+  aws s3 sync --recursive --delete $1 s3://${2}/$1
+}
+
+#############
+## Account ##
+#############
+aws_profile() { # [aws profile name]; # Set/Show the AWS profile (account)
+  local profile="$1"
+  if [ -z "$profile" ]; then
+    if [ -z "$AWS_DEFAULT_PROFILE" ]; then
+      echo "Usage: $0 <aws profile name>" >&2
+      return 1
+    else
+      echo $AWS_DEFAULT_PROFILE
+    fi
+    return
+  fi
+  if [ -r ~/.aws/api_keys/$profile ]; then
+    . ~/.aws/api_keys/$profile
+    export AWS_DEFAULT_PROFILE="$profile"
+    [ "$profile" != 'live' ] && echo $profile > ~/.aws_saved_profile
+  else
+    echo "No such profile: $profile" >&2
+    return 2
+  fi
+}
+
+aws_profiles() { #; # Get a list of AWS profiles
+  (cd ~/.aws/api_keys && ls -1)
+}
+
+aws_each_profile() { # <sub command>; # Run given subcommand on all AWS accounts
+  for profile in $(aws_profiles); do
+    aws_profile $profile
+    echo "${TERM_GREEN}=== PROFILE: $profile ===${TERM_NORM}"
+    awshelper $@
+  done
+}
+
+u_aws_each_profile() { # <sub command>; # Run given subcommand on all AWS accounts, unformatted
+  for profile in $(aws_profiles); do
+    aws_profile $profile
+    for word in $($@); do
+      echo $profile: $word
+    done
+  done
+}
+
+aws_each_region() { # <sub command>; # Run given subcommand on each region
+  for region in us-east-1 us-west-2; do
+    #echo "${TERM_BLUE}=== REGION: $region ===${TERM_NORM}"
+    echo "- $region"
+    export AWS_DEFAULT_REGION=$region
+    awshelper $@
+  done
+}
+
+u_aws_each_region() { # <sub command>; # Run given subcommand on each region, unformatted
+  for region in us-east-1 us-west-2; do
+    export AWS_DEFAULT_REGION=$region
+    echo $AWS_DEFAULT_REGION: $($@)
+  done
+}
+
+availability_zones() { #; # Get unformatted list of AZs for this account and region
+  aws ec2 describe-availability-zones --query 'AvailabilityZones[*].{Az:ZoneName}' --output text |sed 's/^/    - /g'
+}
+
+sync_aws_profiles() { #; # Sync AWS profiles from tesla. Prompts for aptdevadm password.
+  ( cd $HOME; rsync -avz --delete --exclude '.aws/.git' aptdevadm@tesla:.aws . )
+  echo "DONE."
+  [ -z "$AWS_DEFAULT_PROFILE" ] && echo "Set your profile with 'aws_profile <profile name>'"
+}
+
+sync_aws_ssh_keys() { #; # Sync AWS SSH keys from tesla.  Does not overwrite files.
+  echo "This does not overwrite files.  If you want to ${TERM_RED}really${TERM_NORM} sync, run this command:"
+  echo 'rsync -avz aptdevadm@tesla:aws_credentials/* ~/.ssh'
+  #rsync --ignore-existing -avz aptdevadm@tesla:aws_credentials/* ~/.ssh
+}
+
+install_awscli() { #; # Install the latest awscli. Remove exiting awscli first!
+  cd /tmp
+  curl -ksLO "https://s3.amazonaws.com/aws-cli/awscli-bundle.zip"
+  unzip awscli-bundle.zip
+  sudo ./awscli-bundle/install -i /usr/local/aws -b /usr/local/bin/aws
+  rm -rf awscli-bundle.zip awscli-bundle
+}
+
+#;##########
+#;## Help ##
+#;##########
+_help() { # ; # Display help message
+  echo "Fancy help command here"
+}
+
+#;#############
+#;## Private ##
+#;#############
+
+EC2_RUNNING_FILTER='Name=instance-state-name,Values=running'
+KEY_NAME_QUERY='Reservations[*].Instances[].KeyName'
+_ssh_key_by_public_dns_name() { # <EC2 public dns name>; # Get ssh key name for public dns name
+  aws ec2 describe-instances --filters Name=dns-name,Values=$1 $EC2_RUNNING_FILTER Name=instance-state-name,Values=running --query $KEY_NAME_QUERY --output text
+}
+
+_ssh_key_by_private_dns_name() { # <EC2 private dns name>; # Get ssh key name for private dns name
+  aws ec2 describe-instances --filters Name=private-dns-name,Values=$1 $EC2_RUNNING_FILTER Name=instance-state-name,Values=running --query $KEY_NAME_QUERY --output text
+}
+
+_ssh_key_by_public_ip() { # <EC2 public IP address>; # Get ssh key name for public ip address
+  aws ec2 describe-instances --filters Name=ip-address,Values=$1 $EC2_RUNNING_FILTER Name=instance-state-name,Values=running --query $KEY_NAME_QUERY --output text --query $KEY_NAME_QUERY --output text
+}
+
+_ssh_key_by_private_ip() { # <EC2 private IP address>; # Get ssh key name for private ip address
+  aws ec2 describe-instances --filters Name=private-ip-address,Values=$1 $EC2_RUNNING_FILTER Name=instance-state-name,Values=running --query $KEY_NAME_QUERY --output text
+}
+
+_ssh_key_by_instance_id() { # <EC2 instance ID>; # Get ssh key name for EC2 instance id
+  aws ec2 describe-instances --filters Name=instance-id,Values=$1 $EC2_RUNNING_FILTER --query $KEY_NAME_QUERY --output text
+}
+
+PUBLIC_DNS_NAME_QUERY='Reservations[*].Instances[].PublicDnsName'
+_public_dns_name_by_instance_name_tag() { # <instance Name tag> ; # Get the public DNS name based on the Name tag
+      aws ec2 describe-instances --filters "Name=tag:Name,Values=$1" $EC2_RUNNING_FILTER --query $PUBLIC_DNS_NAME_QUERY --output text
+}
+
+_public_dns_name_by_instance_id() { # <EC2 instance ID>; # Get public dns name for EC2 instance id
+  aws ec2 describe-instances --filters Name=instance-id,Values=$1 $EC2_RUNNING_FILTER --query $PUBLIC_DNS_NAME_QUERY --output text
+}
+
+_public_dns_name_by_instance_name_tag() { # <ec2 instance name tag>; # Get public dns name for instance with given name tag
+  aws ec2 describe-instances --filters "Name=tag:Name,Values=$1" $EC2_RUNNING_FILTER --query $PUBLIC_DNS_NAME_QUERY --output text
+}
+
+_os_type_tag_by_ami() { # <AMI ID>; # Find the value of the OS_Type tag for the given AMI
+  aws ec2 describe-images --image-ids $1 --query 'Images[0].Tags[?Key==`OS_Type`].Value' --output text
+}
+
+_ami_by_instance_id() { # <Instance ID>; # Find the AMI ID for the given instance ID
+  aws ec2 describe-instances --instance-ids $1 --query 'Reservations[0].Instances[0].ImageId' --output text
+}
+
+_instance_name_to_instance_id() { # <instance name> ; # Convert instance name to instance id
+      aws ec2 describe-instances --filters "Name=tag:Name,Values=${1}" 'Name=instance-state-name,Values=running' --query 'Reservations[*].Instances[].InstanceId' --output text
+}
+
+_is_private_ip_address() { # <ip address>; # Test if ip is public or private
+  ip=$1
+  if  [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then # It's an IP address!
+    if  [[ $ip =~ ^10\. ]]; then                                    # It belongs to 10.0.0.0/8 => private
+      echo 'private'
+    elif  [[ $ip =~ ^192\.168\. ]]; then                            # It belongs to 192.168.0.0/16 => private
+      echo 'private'
+    elif [[ $ip =~ ^172\. ]]; then                                  # It belongs to 172.0.0.0/8 => Might be private, check harder
+      second_octet=$(echo $ip |cut -f2 -d'.')
+      if [ "$second_octet" -ge 16 -a "$second_octet" -le 31 ]; then # It belongs to 172.16.0.0/12 => private
+        echo 'private'
+      else                                                          # It's in 172.0.0.0/8, but lies outside the reserved range => public
+        echo 'public'
+      fi
+    else                                                            # Not in a reserved range => public
+      echo 'public'
+    fi
+  else                                                              # It's not an IP address => ERROR
+    echo "err_not_ip"
+    return 1
+  fi
+}
+
+_aws_ssh_helper() { #[username]@<ip|dns name|instance id>; # Compute/retrieve username, ip address, and ssh key given ssh host specifier
+  host=$1
+  username=ubuntu # Default the username to ubuntu
+
+  if [ -z "$host" ]; then
+      echo "ERROR: Frobular Ignastica (8675309).  A host would help.  Exiting with extreme disdain."
+      return 254
+  fi
+
+  # using username@hostname notation
+  if [[ "$host" =~ '@' ]]; then
+      username=$(echo $host |cut -f1 -d'@')
+      host=$(echo $host |cut -f2 -d'@')
+  fi
+
+  # Using a Name of some sort
+  if [[ "$host" =~ [a-z] ]]; then
+
+    # Using EC2 Instance ID
+    if [[ "$host" =~ ^i- ]]; then
+      ssh_key=$(_ssh_key_by_instance_id $host)
+      host=$(_public_dns_name_by_instance_id $host)
+
+    # Using EC2 Private DNS Name
+    elif [[ "$host" =~ internal$ ]]; then
+      ssh_key=$(_ssh_key_by_private_dns_name $host)
+      host=$(echo $host |sed -e 's/ip-//' -e 's/\..*$//' -e 's/-/./g')
+
+    # Using EC2 Public DNS Name
+    elif [[ "$host" =~ amazonaws.com$ ]]; then
+      ssh_key=$(_ssh_key_by_public_dns_name $host)
+
+    # Using EC2 instance name (instance/stack)
+    elif [[ "$host" =~ \/ ]]; then
+      host=$(_public_dns_name_by_instance_name_tag $host)
+      ssh_key=$(_ssh_key_by_public_dns_name $host)
+    fi
+
+  # Using IP address
+  else
+    # Using private IP address
+    if [ "$(_is_private_ip_address $host)" = "private" ]; then
+      ssh_key=$(_ssh_key_by_private_ip $host)
+
+    # Using public IP address
+    else
+      ssh_key=$(_ssh_key_by_public_ip $host)
+    fi
+  fi
+  echo $username $host $ssh_key
+}
+
+#;#######################
+#;# Internal machinery ##
+#;#######################
+_awshelper_list() { # ; # Get list of awshelpers
+  if [ "$1" = "all" ]; then
+    regex='^[a-zA-Z0-9_][a-zA-Z0-9_]*\(\)|^##'
+  else
+    regex='^[a-zA-Z0-9][a-zA-Z0-9_]*\(\)|^##'
+  fi
+  egrep $regex $EXEC \
+    | sed 's/(.[^#]*#//' \
+    | column -t -s ';' \
+    | sed -e "s/^##(/                      /g" \
+    | sed \
+        -e "s/\(\[\)\([^]]*\)\(\]\)/${TERM_ORANGE}\1${TERM_GREEN}\2${TERM_ORANGE}\3${TERM_NORM}/g" \
+        -e "s/^\([a-zA-Z0-9_-]*\)/${TERM_BLUE}\1${TERM_NORM}/" \
+        -e "s/\(<\)\([^>]*\)\(>\)/${TERM_ORANGE}\1${TERM_PURPLE}\2${TERM_ORANGE}\3${TERM_NORM}/g" \
+        -e "s/#/${TERM_BOLD}${TERM_WHITE}|${TERM_RESET}/g"
+}
+
+# Create command completions for awshelper
+_awshelper_command_completion() { # ; # Get list of awshelper commands
+  local cur prev opts
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  opts=$(cat $PROJECTS_HOME/swa_home/bin/awshelper | egrep '^[a-zA-Z0-9]+[a-zA-Z0-9_]*\(\)' |cut -f1 -d'(')
+  COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+}
+
+complete -F _awshelper_command_completion awshelper
+
+# Create command completions for aws_profile
+_awsprofile_command_completion() { # ; # Get list of awshelper commands
+  local cur prev opts
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  opts=$(ls ~/.aws/api_keys)
+  COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+}
+
+complete -F _awsprofile_command_completion aws_profile
+complete -F _awsprofile_command_completion profile
+
+# Determine if we were sourced or called as a script.
+# If sourced, restore the profile and display a note
+# If called as a script with no args, display a formatted list of awshelpers
+# If called as a script with --all/-a, display a formatted list of all awshelpers
+# If called as a script with args, run the first arg as a subcommand passing remaining args as parameters
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then   # Running as a script
+  if [[ "$#" == 0 && ( "$SCRIPTNAME" == "awshelper" || "$SCRIPTNAME" == "awshelper") ]]; then  # No arguments given
+    _awshelper_list
+  elif [ "$1" = "-a" -o "$1" = "--all" ]; then # The all arg given, so list sub commands including private
+    _awshelper_list all
+  else                                         # Run the sub-command with its arguments
+    $@
+  fi
+else                                           # This file was sourced, so configure the environment with awshelper goodness
+  if [[ "$-" =~ i ]]; then                     # This shell is interactive
+    echo "${TERM_PURPLE}AWS Helpers loaded!  Run ${TERM_BLUE}awshelper${TERM_PURPLE} for help.${TERM_NORM}"
+    if [ -r ~/.aws_saved_profile ]; then
+      aws_profile $(< ~/.aws_saved_profile) > /dev/null 2>&1 # Load the saved aws_profile
+      echo "Loaded previous AWS profile: ${TERM_ORANGE}${AWS_DEFAULT_PROFILE}${TERM_NORM}"
+    else
+      echo "No saved AWS profile.  Use ${TERM_BLUE}aws_profile ${TERM_ORANGE}<${TERM_GREEN}profile${TERM_ORANGE}>${TERM_NORM} to set."
+    fi
+  fi
+fi
